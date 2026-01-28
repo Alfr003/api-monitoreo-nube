@@ -5,6 +5,9 @@ from pathlib import Path
 import json
 import os
 from zoneinfo import ZoneInfo
+from flask import Response
+import csv
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -66,6 +69,31 @@ def bucket_hora_2h(dt_local: datetime) -> str:
     if h2 == 0:
         return "24:00"
     return f"{h2:02d}:00"
+def iter_historial(max_lines=None):
+    """Itera historial.jsonl línea por línea (sin cargar todo a memoria)."""
+    if not HIST_FILE.exists():
+        return
+    with HIST_FILE.open("r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except:
+                continue
+
+def to_local_dt(item):
+    tz = get_local_tz()
+    dt = parse_ts(item)
+    if not dt:
+        return None
+    # si viene sin tz, asume UTC
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+    else:
+        dt = dt.astimezone(tz)
+    return dt
 
 def build_tabla_5dias(zona: str, days: int = 5, max_lines: int = 8000):
     tz = get_local_tz()
@@ -167,6 +195,118 @@ def get_historial():
     data = [json.loads(x) for x in lines[-n:] if x.strip()]
     return jsonify(data)
 
+@app.get("/api/historial_resumen")
+def historial_resumen():
+    """
+    Devuelve meses/días disponibles para filtros.
+    """
+    meses = set()
+    dias_por_mes = {}  # "YYYY-MM" -> set("YYYY-MM-DD")
+    for item in iter_historial():
+        dt = to_local_dt(item)
+        if not dt:
+            continue
+        ym = dt.strftime("%Y-%m")
+        ymd = dt.strftime("%Y-%m-%d")
+        meses.add(ym)
+        dias_por_mes.setdefault(ym, set()).add(ymd)
+
+    meses = sorted(list(meses))
+    dias_por_mes_out = {k: sorted(list(v)) for k, v in dias_por_mes.items()}
+
+    return jsonify({
+        "meses": meses,
+        "dias_por_mes": dias_por_mes_out
+    })
+
+@app.get("/api/historial_filtro")
+def historial_filtro():
+    """
+    Filtros:
+      - zona=Z1
+      - mes=YYYY-MM (opcional)
+      - dia=YYYY-MM-DD (opcional)
+      - hora=HH (opcional, 00-23)
+      - n=5000 (límite opcional)
+    """
+    zona = request.args.get("zona", "Z1")
+    mes = request.args.get("mes")        # "2026-01"
+    dia = request.args.get("dia")        # "2026-01-28"
+    hora = request.args.get("hora")      # "11"
+    n = int(request.args.get("n", "5000"))
+
+    out = []
+    for item in iter_historial():
+        if (item.get("zona", "Z1") != zona):
+            continue
+
+        dt = to_local_dt(item)
+        if not dt:
+            continue
+
+        if mes and dt.strftime("%Y-%m") != mes:
+            continue
+        if dia and dt.strftime("%Y-%m-%d") != dia:
+            continue
+        if hora and dt.strftime("%H") != hora.zfill(2):
+            continue
+
+        out.append({
+            "fecha": dt.strftime("%Y-%m-%d"),
+            "hora": dt.strftime("%H:%M"),
+            "temperatura": item.get("temperatura"),
+            "humedad": item.get("humedad"),
+            "zona": item.get("zona", "Z1"),
+            "ts": dt.isoformat()
+        })
+
+        if len(out) >= n:
+            break
+
+    # Ordena (más reciente arriba)
+    out.sort(key=lambda x: x["ts"], reverse=True)
+    return jsonify(out)
+
+@app.get("/api/historial_export")
+def historial_export():
+    """
+    Exporta CSV (Excel compatible). Params:
+      - zona=Z1
+      - mes=YYYY-MM (opcional)
+    Si no mandas mes => exporta TODO.
+    """
+    zona = request.args.get("zona", "Z1")
+    mes = request.args.get("mes")  # opcional
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["fecha", "hora", "temperatura", "humedad", "zona"])
+
+    count = 0
+    for item in iter_historial():
+        if item.get("zona", "Z1") != zona:
+            continue
+        dt = to_local_dt(item)
+        if not dt:
+            continue
+
+        if mes and dt.strftime("%Y-%m") != mes:
+            continue
+
+        writer.writerow([
+            dt.strftime("%Y-%m-%d"),
+            dt.strftime("%H:%M"),
+            item.get("temperatura", ""),
+            item.get("humedad", ""),
+            item.get("zona", "Z1")
+        ])
+        count += 1
+
+    filename = f"historial_{zona}_{mes if mes else 'TODO'}.csv"
+    resp = Response(output.getvalue(), mimetype="text/csv; charset=utf-8")
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp
+
 @app.get("/api/historicos")
 def get_historicos_5dias():
     zona = request.args.get("zona", "Z1")
@@ -200,5 +340,6 @@ def post_datos():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
 
