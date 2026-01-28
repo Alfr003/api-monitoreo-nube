@@ -3,6 +3,140 @@ from flask_cors import CORS
 from datetime import datetime
 from pathlib import Path
 import json
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+HORAS_2H = ["02:00","04:00","06:00","08:00","10:00","12:00","14:00","16:00","18:00","20:00","22:00","24:00"]
+DOW_ES = ["Lun.", "Mar.", "Mié.", "Jue.", "Vie.", "Sáb.", "Dom."]
+
+def parse_ts(item: dict) -> datetime | None:
+    """
+    Intenta parsear timestamp en estos formatos comunes:
+    - "YYYY-MM-DD HH:MM:SS"
+    - ISO: "YYYY-MM-DDTHH:MM:SS(.micro)"
+    """
+    s = item.get("timestamp") or item.get("ts_server")
+    if not s:
+        return None
+
+    s = s.strip()
+    # soporta "YYYY-MM-DD HH:MM:SS"
+    try:
+        if "T" not in s and len(s) >= 19 and s[10] == " ":
+            return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+    except:
+        pass
+
+    # ISO (con o sin microsegundos)
+    try:
+        return datetime.fromisoformat(s.replace("Z", ""))
+    except:
+        return None
+
+def get_local_tz():
+    # En Render puedes poner TZ=America/Costa_Rica o America/Mexico_City
+    tzname = os.environ.get("TZ", "UTC")
+    try:
+        return ZoneInfo(tzname)
+    except:
+        return ZoneInfo("UTC")
+
+def bucket_hora_2h(dt_local: datetime) -> str:
+    """
+    Agrupa por bloque de 2 horas usando floor.
+    00:00-01:59 -> 24:00 (misma fecha, por cómo está tu tabla)
+    02:00-03:59 -> 02:00
+    ...
+    22:00-23:59 -> 22:00
+    """
+    h = dt_local.hour
+    # floor al par
+    h2 = (h // 2) * 2
+    if h2 == 0:
+        return "24:00"
+    return f"{h2:02d}:00"
+
+def build_tabla_5dias(zona: str, days: int = 5, max_lines: int = 8000):
+    """
+    Lee historial.jsonl, toma últimos 5 días reales y deja 12 datos (cada 2h) por día.
+    """
+    tz = get_local_tz()
+    today = datetime.now(tz).date()
+    fechas = [today - timedelta(days=(days-1-i)) for i in range(days)]  # viejo -> nuevo
+    fechas_str = [d.isoformat() for d in fechas]
+
+    # matriz: por hora (12) -> lista 5 (días)
+    celdas = {h: [None]*days for h in HORAS_2H}
+
+    if not HIST_FILE.exists():
+        return {
+            "zona": zona,
+            "fechas": fechas_str,
+            "dias": [f"{DOW_ES[d.weekday()]} {d.day:02d}" for d in fechas],
+            "horas": HORAS_2H,
+            "celdas": celdas
+        }
+
+    # leemos solo el final del archivo para no cargar infinito
+    lines = HIST_FILE.read_text(encoding="utf-8").splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+
+    # para quedarnos con el último dato por (fecha, bucket)
+    best = {}  # key=(fecha_str, bucket) -> (dt_local, item)
+
+    for ln in lines:
+        if not ln.strip():
+            continue
+        try:
+            item = json.loads(ln)
+        except:
+            continue
+
+        if item.get("zona") != zona:
+            continue
+
+        dt = parse_ts(item)
+        if not dt:
+            continue
+
+        # si dt viene sin tz, lo tomamos como UTC y lo pasamos a local
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+        else:
+            dt = dt.astimezone(tz)
+
+        fecha_str = dt.date().isoformat()
+        if fecha_str not in fechas_str:
+            continue
+
+        bucket = bucket_hora_2h(dt)
+        key = (fecha_str, bucket)
+        prev = best.get(key)
+        if (prev is None) or (dt > prev[0]):
+            best[key] = (dt, item)
+
+    # llenar celdas
+    for (fecha_str, bucket), (dt, item) in best.items():
+        d_index = fechas_str.index(fecha_str)
+        # t/h en tu JSON vienen como temperatura/humedad
+        t = item.get("temperatura")
+        h = item.get("humedad")
+        if t is None or h is None:
+            continue
+        celdas[bucket][d_index] = {
+            "t": float(t),
+            "h": float(h),
+            "ts": dt.isoformat()
+        }
+
+    return {
+        "zona": zona,
+        "fechas": fechas_str,
+        "dias": [f"{DOW_ES[d.weekday()]} {d.day:02d}" for d in fechas],
+        "horas": HORAS_2H,
+        "celdas": celdas
+    }
 
 app = Flask(__name__)
 CORS(app)
@@ -32,6 +166,12 @@ def get_historial():
     lines = HIST_FILE.read_text(encoding="utf-8").splitlines()
     data = [json.loads(x) for x in lines[-n:] if x.strip()]
     return jsonify(data)
+    
+@app.get("/api/historicos")
+def get_historicos_5dias():
+    zona = request.args.get("zona", "Z1")
+    data = build_tabla_5dias(zona=zona, days=5)
+    return jsonify(data)
 
 @app.post("/api/datos")
 def post_datos():
@@ -47,4 +187,5 @@ def post_datos():
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
     return jsonify({"status": "ok"})
+
 
