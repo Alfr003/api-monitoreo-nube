@@ -47,7 +47,7 @@ def parse_ts(item: dict):
         return None
 
 def get_local_tz():
-    # En Render puedes poner TZ=America/Costa_Rica o America/Mexico_City
+    # En Render define TZ=America/Costa_Rica
     tzname = os.environ.get("TZ", "UTC")
     try:
         return ZoneInfo(tzname)
@@ -58,9 +58,6 @@ def bucket_hora_2h(dt_local: datetime) -> str:
     """
     Agrupa por bloque de 2 horas usando floor.
     00:00-01:59 -> 24:00 (misma fecha, por cómo está tu tabla)
-    02:00-03:59 -> 02:00
-    ...
-    22:00-23:59 -> 22:00
     """
     h2 = (dt_local.hour // 2) * 2
     if h2 == 0:
@@ -145,7 +142,7 @@ def build_tabla_5dias(zona: str, days: int = 5, max_lines: int = 8000):
     }
 
 # -----------------------------
-# Rutas existentes
+# Rutas
 # -----------------------------
 @app.get("/")
 def home():
@@ -170,13 +167,22 @@ def get_historial():
 @app.get("/api/historicos")
 def get_historicos_5dias():
     zona = request.args.get("zona", "Z1")
-    data = build_tabla_5dias(zona=zona, days=5)
-    return jsonify(data)
+    return jsonify(build_tabla_5dias(zona=zona, days=5))
 
 @app.post("/api/datos")
 def post_datos():
+    # ✅ Seguridad: si existe API_KEY en Render, exige header X-API-KEY
+    api_key = os.environ.get("API_KEY")
+    if api_key:
+        incoming = request.headers.get("X-API-KEY", "")
+        if incoming != api_key:
+            return jsonify({"status": "forbidden"}), 403
+
     data = request.get_json(force=True)
+
+    # defaults y sello del server
     data.setdefault("zona", "Z1")
+    data.setdefault("timestamp", datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
     data["ts_server"] = now_utc()
 
     DATA_FILE.write_text(
@@ -188,3 +194,7 @@ def post_datos():
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
     return jsonify({"status": "ok"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
+
