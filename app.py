@@ -1,53 +1,125 @@
 from flask import Flask, request, jsonify
-import os, json
 from flask_cors import CORS
 from datetime import datetime
-from pathlib import Path
+import os
+
+from sqlalchemy import create_engine, text
 
 app = Flask(__name__)
 CORS(app)
 
-DATA_FILE = Path("datos_actuales.json")
-HIST_FILE = Path("historial.jsonl")  # JSON Lines (1 registro por línea)
+# -------------------------
+# Helpers
+# -------------------------
+def now_utc_iso():
+    return datetime.utcnow().replace(microsecond=0).isoformat()
 
-def now_utc():
-    return datetime.utcnow().isoformat()
+def require_db_url():
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        raise RuntimeError("Falta DATABASE_URL en variables de entorno (Render).")
+    return db_url
+
+# -------------------------
+# DB (Postgres)
+# -------------------------
+DATABASE_URL = require_db_url()
+
+# pool_pre_ping ayuda a evitar conexiones muertas en Render
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+# Creamos tabla si no existe
+# Guardamos: humedad, temperatura, timestamp (del sensor), ts_server (del servidor), zona
+CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS lecturas (
+  id SERIAL PRIMARY KEY,
+  zona TEXT,
+  temperatura DOUBLE PRECISION,
+  humedad DOUBLE PRECISION,
+  timestamp TEXT,
+  ts_server TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+with engine.begin() as conn:
+    conn.execute(text(CREATE_TABLE_SQL))
 
 @app.get("/")
 def home():
     return "API OK. Usa /api/datos y /api/historial"
 
+# -------------------------
+# GET último dato
+# -------------------------
 @app.get("/api/datos")
 def get_datos():
-    if DATA_FILE.exists():
-        return jsonify(json.loads(DATA_FILE.read_text(encoding="utf-8")))
-    return jsonify({"status": "sin_datos"}), 404
+    # Regresa la última lectura (la más reciente)
+    sql = """
+    SELECT zona, temperatura, humedad, timestamp, ts_server
+    FROM lecturas
+    ORDER BY id DESC
+    LIMIT 1;
+    """
+    with engine.begin() as conn:
+        row = conn.execute(text(sql)).mappings().first()
 
+    if not row:
+        return jsonify({"status": "sin_datos"}), 404
+
+    return jsonify(dict(row))
+
+# -------------------------
+# GET historial (últimos N)
+# -------------------------
 @app.get("/api/historial")
 def get_historial():
-    # devuelve los últimos N registros (por defecto 200)
     n = int(request.args.get("n", "200"))
-    if not HIST_FILE.exists():
-        return jsonify([])
 
-    lines = HIST_FILE.read_text(encoding="utf-8").splitlines()
-    last = lines[-n:] if n > 0 else lines
-    data = [json.loads(x) for x in last if x.strip()]
-    return jsonify(data)
+    sql = """
+    SELECT zona, temperatura, humedad, timestamp, ts_server
+    FROM lecturas
+    ORDER BY id DESC
+    LIMIT :n;
+    """
 
+    with engine.begin() as conn:
+        rows = conn.execute(text(sql), {"n": n}).mappings().all()
+
+    # lo devolvemos como lista de dicts
+    return jsonify([dict(r) for r in rows])
+
+# -------------------------
+# POST guardar dato (inserta en BD)
+# -------------------------
 @app.post("/api/datos")
 def post_datos():
-    data = request.get_json(force=True)
-    data.setdefault("ts_server", now_utc())
+    data = request.get_json(force=True) or {}
 
-    # guarda el último
-    DATA_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    # Normaliza campos esperados
+    zona = data.get("zona", "Z1")
+    temperatura = data.get("temperatura", None)
+    humedad = data.get("humedad", None)
+    timestamp = data.get("timestamp", None)   # lo que mande tu ESP32/script
+    ts_server = data.get("ts_server", now_utc_iso())
 
-    # agrega al historial (1 línea)
-    with HIST_FILE.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+    sql = """
+    INSERT INTO lecturas (zona, temperatura, humedad, timestamp, ts_server)
+    VALUES (:zona, :temperatura, :humedad, :timestamp, :ts_server)
+    RETURNING id;
+    """
 
-    return jsonify({"status": "ok"})
+    with engine.begin() as conn:
+        new_id = conn.execute(
+            text(sql),
+            {
+                "zona": zona,
+                "temperatura": temperatura,
+                "humedad": humedad,
+                "timestamp": timestamp,
+                "ts_server": ts_server,
+            },
+        ).scalar_one()
 
-
+    return jsonify({"status": "ok", "id": new_id})
 
