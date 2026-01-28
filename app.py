@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify
 import os, json
+from flask_cors import CORS
 from datetime import datetime
 from pathlib import Path
 
 app = Flask(__name__)
+CORS(app)
 
 DATA_FILE = Path("datos_actuales.json")
 HIST_FILE = Path("historial.jsonl")  # JSON Lines (1 registro por línea)
@@ -46,5 +48,6 @@ def post_datos():
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
     return jsonify({"status": "ok"})
+
 
 
