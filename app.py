@@ -18,8 +18,11 @@ HIST_FILE = Path("historial.jsonl")  # JSON Lines
 HORAS_2H = ["02:00","04:00","06:00","08:00","10:00","12:00","14:00","16:00","18:00","20:00","22:00","24:00"]
 DOW_ES = ["Lun.", "Mar.", "Mié.", "Jue.", "Vie.", "Sáb.", "Dom."]
 
+from datetime import datetime, timezone
+
 def now_utc():
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
 
 def parse_ts(item: dict):
     """
@@ -197,4 +200,5 @@ def post_datos():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
+
 
